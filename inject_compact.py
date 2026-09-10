@@ -13,7 +13,9 @@ import array
 import ctypes
 import fcntl
 import glob
+import json
 import os
+import pwd
 import sys
 import time
 
@@ -112,6 +114,59 @@ def cpu_ticks(pid):
     return int(fields[11]) + int(fields[12])  # utime + stime
 
 
+# stop_reasons that mean the assistant handed the turn back and the prompt is idle.
+TERMINAL_STOP = {"end_turn", "max_tokens", "stop_sequence"}
+
+
+def find_transcript(pid):
+    """Locate this session's transcript jsonl from the claude process, or None.
+
+    Claude Code stores it at <owner-home>/.claude/projects/<cwd-with-/-as-->/<session>.jsonl
+    and does not hold it open, so it is found by cwd-derived slug + newest mtime.
+    """
+    try:
+        cwd = os.readlink(f"/proc/{pid}/cwd")
+        home = pwd.getpwuid(os.stat(f"/proc/{pid}").st_uid).pw_dir
+    except OSError:
+        return None
+    base = os.path.join(home, ".claude", "projects", cwd.replace("/", "-"))
+    jsonls = glob.glob(os.path.join(base, "*.jsonl"))
+    if not jsonls:
+        return None
+    return max(jsonls, key=lambda p: os.path.getmtime(p))
+
+
+def turn_complete(path):
+    """True when the transcript's newest substantive entry is a finished assistant turn.
+
+    During a turn the tail is tool_use / tool_result / attachment entries; a completed
+    turn ends with an assistant message whose stop_reason is terminal and nothing after
+    it. A network-blocked generation has no such entry yet, so this stays False.
+    """
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 65536))
+            chunk = f.read()
+    except OSError:
+        return False
+    for raw in reversed(chunk.split(b"\n")):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            o = json.loads(raw)
+        except ValueError:
+            continue  # partial first line of the chunk
+        t = o.get("type")
+        if t == "assistant":
+            return (o.get("message") or {}).get("stop_reason") in TERMINAL_STOP
+        if t in ("user", "attachment"):
+            return False  # a tool result or its attachment: still mid-turn
+    return False
+
+
 def main():
     claude_pid = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else find_claude()
     command = sys.argv[2] if len(sys.argv) > 2 else "/compact"
@@ -129,22 +184,41 @@ def main():
     master = steal_master(claude_pid, ptsnum)
     log(f"master for pts {ptsnum} acquired (claude={claude_pid})")
 
-    time.sleep(2)  # let the arming turn's output finish rendering
+    def inject():
+        os.write(master, b"\x15")       # Ctrl-U: clear any partial input line
+        time.sleep(0.15)
+        os.write(master, command.encode())
+        time.sleep(0.4)
+        os.write(master, b"\r")         # Enter: submit
+        log(f"injected {command!r} after idle")
+
+    time.sleep(1)  # let the arming turn settle before sampling
+    transcript = find_transcript(claude_pid)
+    deadline = time.time() + 90
+
+    if transcript:
+        # Primary gate: fire once the session's own transcript shows a finished turn
+        # that then stays quiet ~1s, i.e. the prompt is genuinely idle and waiting.
+        log(f"gating on transcript {transcript}")
+        while time.time() < deadline:
+            time.sleep(0.5)
+            if turn_complete(transcript) and time.time() - os.path.getmtime(transcript) >= 1.0:
+                inject()
+                return
+        log("gave up: transcript never reached an idle turn within 90s")
+        return
+
+    # Fallback (transcript not found): the original CPU-idle heuristic.
+    log("transcript not found; falling back to cpu-idle gate")
     idle_run = 0
     last = cpu_ticks(claude_pid)
-    deadline = time.time() + 90
     while time.time() < deadline:
         time.sleep(0.5)
         now = cpu_ticks(claude_pid)
         idle_run = idle_run + 1 if now - last <= 1 else 0
         last = now
         if idle_run >= 3:
-            os.write(master, b"\x15")   # Ctrl-U: clear any partial input line
-            time.sleep(0.15)
-            os.write(master, command.encode())
-            time.sleep(0.4)
-            os.write(master, b"\r")     # Enter: submit
-            log(f"injected {command!r} after idle")
+            inject()
             return
     log("gave up: no idle window within 90s")
 

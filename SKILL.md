@@ -30,7 +30,7 @@ For a different command, pass it as the second argument, e.g. `... inject_compac
 
 ## Why it must be detached and idle-gated
 
-Keystrokes that arrive while the session is busy in a tool call are queued, not executed, so a `/compact` typed mid-turn does nothing until the prompt goes idle. The script detaches with `setsid`, waits for the arming turn to finish, then watches the claude process's CPU ticks in `/proc/<pid>/stat` and fires a single `/compact` only once the process has been idle for about 1.5 seconds. It gives up after 90 seconds. It never repeats, so it cannot spam the input line.
+Keystrokes that arrive while the session is busy in a tool call are queued, not executed, so a `/compact` typed mid-turn does nothing until the prompt goes idle. The script detaches with `setsid`, then watches this session's own transcript jsonl and fires a single `/compact` only once its newest entry is a finished assistant turn (`stop_reason` `end_turn`) that then stays quiet for about a second. That is a real prompt-idle signal: a turn blocked on network I/O has not written its `end_turn` yet, so it will not fire early. If the transcript cannot be located it falls back to a CPU-idle heuristic on `/proc/<pid>/stat`. It gives up after 90 seconds, and it never repeats, so it cannot spam the input line.
 
 Because the injection lands at the idle prompt, end your turn right after arming — do not keep working, or the keystrokes will queue behind you.
 
